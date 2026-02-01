@@ -1,96 +1,58 @@
-#![no_std]
-#![no_main]
-
-use core::{arch::asm, mem::transmute, ops::Add};
-
 use aarch64_cpu::{
-    asm::{self, nop, wfe},
-    registers::{MAIR_EL1, SCTLR_EL1, SP, TCR_EL1, TTBR0_EL1, TTBR1_EL1},
+    asm::{self, nop},
+    registers::{MAIR_EL1, SCTLR_EL1, TCR_EL1, TTBR0_EL1, TTBR1_EL1},
 };
-use aarch64_cpu_ext::structures::tte::TTE16K48 as TTENATIVE;
+use aarch64_cpu_ext::structures::tte::AccessPermission;
+use core::{arch::asm, mem::transmute};
+use mars_kernel::vm::{TABLE_ENTRIES, TTENATIVE, TTable};
 use tock_registers::interfaces::*;
 
-extern crate core;
-extern crate semihosting;
-
 unsafe extern "C" {
-    static KERNEL_OFFSET: u64;
-    static KERNEL_LOAD_PHYS_RAW: u64;
-    static KERNEL_LOAD_VIRT_RAW: u64;
+    pub static KERNEL_OFFSET: u64;
+    pub static KERNEL_LOAD_PHYS_RAW: u64;
+    //pub static KERNEL_LOAD_VIRT_RAW: u64;
 }
 
-// num. of entries per table, which is equal to the granule size divided by 8.
-const TABLE_ENTRIES: usize =
-    aarch64_cpu_ext::structures::tte::block_sizes::granule_16k::LEVEL3_PAGE_SIZE / 8usize;
+// static mut IS vulnerable to race conditions, but these are only accessed from a single core
+// LOW meaning TTBR0, the lower part of the address space
+// L0 only has 2 entries
+#[unsafe(link_section = ".reclaimable.tables")]
+static mut LOW_L0: TTable<2> = TTable {
+    entries: [TTENATIVE::invalid(); 2],
+};
 
-#[repr(C, align(16384))]
-pub struct TTable {
-    pub entries: [TTENATIVE; TABLE_ENTRIES],
-}
-
-// static mut is vulnerable to race conditions, but these are only accessed from a single core
-// so who cares
-
-// LOW means TTBR0, the lower part of the address space (which will be partially identity mapped for the transition to virtual memory)
-static mut LOW_L0: TTable = TTable {
+#[unsafe(link_section = ".reclaimable.tables")]
+static mut LOW_L1: TTable<TABLE_ENTRIES> = TTable {
     entries: [TTENATIVE::invalid(); TABLE_ENTRIES],
 };
-static mut LOW_L1: TTable = TTable {
-    entries: [TTENATIVE::invalid(); TABLE_ENTRIES],
-};
-static mut LOW_L2: TTable = TTable {
+
+#[unsafe(link_section = ".reclaimable.tables")]
+static mut LOW_L2: TTable<TABLE_ENTRIES> = TTable {
     entries: [TTENATIVE::invalid(); TABLE_ENTRIES],
 };
 
 // conversely HIGH refers to TTBR1
-static mut HIGH_L0: TTable = TTable {
-    entries: [TTENATIVE::invalid(); TABLE_ENTRIES],
+#[unsafe(link_section = ".reclaimable.tables")]
+static mut HIGH_L0: TTable<2> = TTable {
+    entries: [TTENATIVE::invalid(); 2],
 };
-static mut HIGH_L1: TTable = TTable {
-    entries: [TTENATIVE::invalid(); TABLE_ENTRIES],
-};
-static mut HIGH_L2: TTable = TTable {
+
+#[unsafe(link_section = ".reclaimable.tables")]
+static mut HIGH_L1: TTable<TABLE_ENTRIES> = TTable {
     entries: [TTENATIVE::invalid(); TABLE_ENTRIES],
 };
 
-fn busy_loop() -> ! {
-    loop {
-        wfe();
-    }
-}
+#[unsafe(link_section = ".reclaimable.tables")]
+static mut HIGH_L2: TTable<TABLE_ENTRIES> = TTable {
+    entries: [TTENATIVE::invalid(); TABLE_ENTRIES],
+};
 
-#[unsafe(naked)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() {
-    core::arch::naked_asm!(
-        "ldr x0, ={offset}",
-        "ldr x30, =__boot_stack_top",
-        "sub x30, x30, x0",
-        "mov sp, x30",
-        //
-        "mrs x1, mpidr_el1", // core ID
-        "and x1, x1, #0xFF", // check Aff0 (core ID)
-        "cbnz x1, 1f",
-        "ldr x1, =__bss_start",
-        "ldr x2, =__bss_end",
-        "sub x1, x1, x0",
-        "sub x2, x2, x0",
-        "2: cmp x1, x2",
-        "b.ge 3f",
-        "str xzr, [x1], #8",
-        "b 2b",
-        "3: ldr x0, ={lma}",
-        "ldr x1, ={offset}",
-        "bl {setup}",
-        "1: wfe",
-        "b 1b",
-        offset = sym KERNEL_OFFSET,
-        setup = sym init_mmu,
-        lma = sym KERNEL_LOAD_PHYS_RAW,
-    );
-}
+#[unsafe(link_section = ".reclaimable.tables")]
+static mut HIGH_L2_MMIO: TTable<TABLE_ENTRIES> = TTable {
+    entries: [TTENATIVE::invalid(); TABLE_ENTRIES],
+};
 
-extern "C" fn init_mmu(load_addr: u64, offset: u64) -> ! {
+pub extern "C" fn init_mmu(load_addr: u64, offset: u64) -> ! {
     // attr0=device, attr1=normal
     MAIR_EL1.write(
         MAIR_EL1::Attr0_Device::nonGathering_nonReordering_EarlyWriteAck
@@ -128,10 +90,7 @@ extern "C" fn init_mmu(load_addr: u64, offset: u64) -> ! {
     asm::barrier::dsb(asm::barrier::SY);
     asm::barrier::dsb(asm::barrier::ISH);
 
-    unsafe extern "Rust" {
-        fn arm_init() -> !;
-    }
-    let phys_entry = arm_init as *const () as usize;
+    let phys_entry = crate::arm_init as *const () as usize;
     let virt_entry = phys_entry + (offset as usize);
     let init_virt: fn() -> ! = unsafe { transmute(virt_entry) };
 
@@ -156,7 +115,8 @@ unsafe fn setup_tables(load_addr: u64) {
     }
 
     // align down to 32mib
-    let phys_base = load_addr - (load_addr % (32 * 1024 * 1024));
+    let mut phys_base = load_addr - (load_addr % (32 * 1024 * 1024));
+
     let index = (phys_base >> 25) as usize;
 
     unsafe {
@@ -165,33 +125,56 @@ unsafe fn setup_tables(load_addr: u64) {
         block.set_access_permission(
             aarch64_cpu_ext::structures::tte::AccessPermission::PrivilegedReadWrite,
         );
-        block.set_executable(true);
+        block.set_executable(false);
         block.set_privileged_executable(true);
 
         LOW_L2.entries[index] = block;
     }
 
     unsafe {
+        // L0[1] -> L1
         HIGH_L0.entries[1] = TTENATIVE::new_table(&raw mut HIGH_L1 as *const _ as u64);
+        // L1[0] -> L2
         HIGH_L1.entries[0] = TTENATIVE::new_table(&raw mut HIGH_L2 as *const _ as u64);
+        // L1[1] -> MMIO L2
+        HIGH_L1.entries[1] = TTENATIVE::new_table(&raw mut HIGH_L2_MMIO as *const _ as u64);
     }
 
     for i in 0..4 {
         let block_phys = phys_base + (i * 32 * 1024 * 1024);
         let mut block = TTENATIVE::new_block(block_phys);
         block.set_attr_index(1);
-        block.set_access_permission(
-            aarch64_cpu_ext::structures::tte::AccessPermission::PrivilegedReadWrite,
-        );
-        block.set_executable(true);
+        block.set_access_permission(AccessPermission::PrivilegedReadWrite);
+        block.set_executable(false);
         block.set_privileged_executable(true);
         unsafe {
             HIGH_L2.entries[i as usize] = block;
         }
     }
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn arm_init() {
-    busy_loop();
+    {
+        let block_phys = 0x4000_0000;
+        let mut block = TTENATIVE::new_block(block_phys);
+        block.set_attr_index(1);
+        block.set_access_permission(AccessPermission::PrivilegedReadOnly);
+        block.set_executable(false);
+        block.set_privileged_executable(false);
+        unsafe {
+            HIGH_L2.entries[TABLE_ENTRIES - 1] = block;
+        }
+    }
+
+    // on QEMU all MMIO is in the first GB of memory.
+    // 32MiB (L2 Pages) * 32 (entries) = 1GiB
+    for i in 0..32 {
+        let block_phys = i * 32 * 1024 * 1024;
+        let mut block = TTENATIVE::new_block(block_phys);
+        block.set_attr_index(0);
+        block.set_access_permission(AccessPermission::PrivilegedReadWrite);
+        block.set_executable(false);
+        block.set_privileged_executable(false);
+        unsafe {
+            HIGH_L2_MMIO.entries[i as usize] = block;
+        }
+    }
 }
